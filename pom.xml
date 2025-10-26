@@ -1,0 +1,85 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dev.you</groupId>
+  <artifactId>image-editor</artifactId>
+  <version>1.0.0</version>
+  <name>Image editor</name>
+
+  <properties>
+    <!-- JavaFX LTS -->
+    <java.version>21</java.version>
+    <javafx.version>21.0.4</javafx.version>
+    <!-- Bytedeco bundle with natives for win/mac/linux -->
+    <opencv.platform.version>4.9.0-1.5.10</opencv.platform.version>
+  </properties>
+
+  <dependencies>
+    <!-- JavaFX (controls is enough for this app; plugin will resolve platform libs at runtime) -->
+    <dependency>
+      <groupId>org.openjfx</groupId>
+      <artifactId>javafx-controls</artifactId>
+      <version>${javafx.version}</version>
+    </dependency>
+
+    <!-- Optional: if you see compile errors about Application/Graphics,
+         add javafx-graphics & javafx-base too -->
+    <dependency>
+      <groupId>org.openjfx</groupId>
+      <artifactId>javafx-graphics</artifactId>
+      <version>${javafx.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.openjfx</groupId>
+      <artifactId>javafx-base</artifactId>
+      <version>${javafx.version}</version>
+    </dependency>
+
+    <!-- OpenCV with natives (Windows/macOS/Linux) -->
+    <dependency>
+      <groupId>org.bytedeco</groupId>
+      <artifactId>opencv-platform</artifactId>
+      <version>${opencv.platform.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+
+      <!-- JavaFX Maven Plugin: mvn clean javafx:run  /  mvn javafx:jlink -->
+      <plugin>
+        <groupId>org.openjfx</groupId>
+        <artifactId>javafx-maven-plugin</artifactId>
+        <version>0.0.8</version>
+        <configuration>
+          <mainClass>app.ImageEditor</mainClass>
+        </configuration>
+      </plugin>
+
+      <!-- Shade fat-jar (so you can run with `java -jar`).
+           Note: bytedeco platform jars are large; the jar will be big. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>app.ImageEditor</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+    </plugins>
+  </build>
+</project>
