@@ -24,10 +24,14 @@ import javafx.scene.control.Label;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
 import java.util.stream.Collectors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 
@@ -50,13 +54,33 @@ public class ImageEditor extends Application {
     // UI
     private Button loadBtn, saveBtn;
     private Button simpleCropBtn, seedCropBtn;
-    private CheckBox showMaskCheck;
+    private Button backBtn, forwardBtn;
+    private CheckBox showMaskCheck, chatModeCheck, drawingModeCheck;
     private Slider toleranceSlider;
+    
+    // Drawing mode components
+    private javafx.scene.canvas.Canvas drawCanvas;
+    private javafx.scene.canvas.GraphicsContext drawGC;
+    private List<Point2D> currentPath;
+    private boolean isDrawing = false;
+    
+    // Chat mode components
+    private javafx.scene.control.TextArea chatInput;
+    private javafx.scene.control.TextArea chatHistory;
+    private Button sendButton;
+    private VBox chatBox;
+    private List<String> chatLogs = new ArrayList<>();
+    private static final String CHAT_LOG_FILE = "chat_history.txt";
 
     // Recent files
     private ListView<File> recentListView;
     private ObservableList<File> recentFiles;
     private static final int MAX_RECENT = 12;
+
+    // History (Undo/Redo)
+    private ArrayDeque<BufferedImage> undoStack = new ArrayDeque<>();
+    private ArrayDeque<BufferedImage> redoStack = new ArrayDeque<>();
+    private static final int MAX_HISTORY = 15;
 
     public static void main(String[] args) {
         launch(args);
@@ -70,6 +94,12 @@ public class ImageEditor extends Application {
         imageView.setPreserveRatio(true);
         imageView.setFitWidth(1100);
         imageView.setFitHeight(700);
+        
+        // Initialize drawing canvas
+        drawCanvas = new javafx.scene.canvas.Canvas(1100, 700);
+        drawCanvas.setMouseTransparent(true); // Initially pass events through to imageView
+        drawGC = drawCanvas.getGraphicsContext2D();
+        currentPath = new ArrayList<>();
 
         // Click seed for seed-based crop
         seedCropBtn = new Button("Seed crop (click)");
@@ -93,8 +123,8 @@ public class ImageEditor extends Application {
                 int py = (int) Math.floor(local.getY() * scaleY);
                 if (px >= 0 && py >= 0 && px < originalImage.getWidth() && py < originalImage.getHeight()) {
                     int tol = (int) toleranceSlider.getValue();
-                    previewImage = seedBasedCrop(originalImage, px, py, tol);
-                    updateImageView(previewImage);
+                    BufferedImage newImg = seedBasedCrop(originalImage, px, py, tol);
+                    applyNewImage(newImg);
                 }
             }
         });
@@ -116,8 +146,8 @@ public class ImageEditor extends Application {
             if (originalImage == null)
                 return;
             int tol = (int) toleranceSlider.getValue();
-            previewImage = simpleBackgroundRemoval(originalImage, tol);
-            updateImageView(previewImage);
+            BufferedImage newImg = simpleBackgroundRemoval(originalImage, tol);
+            applyNewImage(newImg);
         });
 
         seedCropBtn.setOnAction(e -> {
@@ -138,10 +168,43 @@ public class ImageEditor extends Application {
             }
         });
 
+        chatModeCheck = new CheckBox("Chat Mode");
+        chatModeCheck.setOnAction(e -> toggleChatMode());
+        
+        drawingModeCheck = new CheckBox("Drawing Mode");
+        drawingModeCheck.setOnAction(e -> toggleDrawingMode());
+        
+        // History buttons
+        backBtn = new Button("Back");
+        backBtn.setOnAction(e -> undo());
+        forwardBtn = new Button("Forward");
+        forwardBtn.setOnAction(e -> redo());
+        updateHistoryButtons();
+        
         var bar = new HBox(8, loadBtn, saveBtn,
                 new Separator(), simpleCropBtn, seedCropBtn,
-                new Separator(), tolLabel, toleranceSlider, showMaskCheck);
+                new Separator(), backBtn, forwardBtn,
+                new Separator(), tolLabel, toleranceSlider, showMaskCheck,
+                new Separator(), drawingModeCheck, chatModeCheck);
         bar.setPadding(new Insets(8));
+        
+        // Initialize chat components
+        chatInput = new javafx.scene.control.TextArea();
+        chatInput.setPrefRowCount(3);
+        chatInput.setPromptText("Enter your image editing command...");
+        chatInput.setWrapText(true);
+        
+        chatHistory = new javafx.scene.control.TextArea();
+        chatHistory.setPrefRowCount(10);
+        chatHistory.setEditable(false);
+        chatHistory.setWrapText(true);
+        
+        sendButton = new Button("Send");
+        sendButton.setOnAction(e -> handleChatCommand());
+        
+        chatBox = new VBox(8, chatHistory, chatInput, sendButton);
+        chatBox.setPadding(new Insets(8));
+        chatBox.setVisible(false);
 
         // Recent files UI
         recentFiles = FXCollections.observableArrayList();
@@ -177,11 +240,15 @@ public class ImageEditor extends Application {
         var headerRow = new HBox(8, recentHeader, clearBtn);
         var recentBox = new VBox(6, headerRow, recentListView);
         recentBox.setPadding(new Insets(8));
-
+        VBox recchatBox = new VBox(8, recentBox, chatBox);
+        // Create a stack pane for image and drawing canvas
+        var imageStack = new StackPane(imageView, drawCanvas);
+        
         var root = new BorderPane();
         root.setTop(bar);
-        root.setLeft(recentBox);
-        root.setCenter(new StackPane(imageView));
+        root.setLeft(recchatBox);
+        root.setCenter(imageStack);
+        //root.setRight(chatBox);
 
         stage.setScene(new Scene(root, 1200, 800));
         stage.show();
@@ -212,6 +279,7 @@ public class ImageEditor extends Application {
             showMaskCheck.setSelected(false);
             updateImageView(originalImage);
             addToRecent(f);
+            clearHistory();
         } catch (IOException ex) {
             showError("Cannot read image: " + ex.getMessage());
         }
@@ -394,6 +462,560 @@ public class ImageEditor extends Application {
                     out.setRGB(x, y, 0x8000FF00); // semi green = foreground
             }
         }
+        return out;
+    }
+
+    /* ========================== History (Undo/Redo) ========================== */
+
+    private BufferedImage getCurrentImage() {
+        return (previewImage != null) ? previewImage : originalImage;
+    }
+
+    private void applyNewImage(BufferedImage newImage) {
+        if (newImage == null) return;
+        BufferedImage current = getCurrentImage();
+        if (current != null) {
+            if (undoStack.size() >= MAX_HISTORY) undoStack.removeFirst();
+            undoStack.addLast(current);
+        }
+        redoStack.clear();
+        previewImage = newImage;
+        showMaskCheck.setSelected(false);
+        lastMask = (lastMask != null) ? lastMask : null; // placeholder to keep compiler calm
+        updateImageView(previewImage);
+        updateHistoryButtons();
+    }
+
+    private void undo() {
+        if (undoStack.isEmpty()) return;
+        BufferedImage current = getCurrentImage();
+        if (current != null) {
+            if (redoStack.size() >= MAX_HISTORY) redoStack.removeFirst();
+            redoStack.addLast(current);
+        }
+        BufferedImage prev = undoStack.removeLast();
+        previewImage = prev;
+        showMaskCheck.setSelected(false);
+        lastMask = null;
+        updateImageView(previewImage);
+        updateHistoryButtons();
+    }
+
+    private void redo() {
+        if (redoStack.isEmpty()) return;
+        BufferedImage current = getCurrentImage();
+        if (current != null) {
+            if (undoStack.size() >= MAX_HISTORY) undoStack.removeFirst();
+            undoStack.addLast(current);
+        }
+        BufferedImage nxt = redoStack.removeLast();
+        previewImage = nxt;
+        showMaskCheck.setSelected(false);
+        lastMask = null;
+        updateImageView(previewImage);
+        updateHistoryButtons();
+    }
+
+    private void clearHistory() {
+        undoStack.clear();
+        redoStack.clear();
+        updateHistoryButtons();
+    }
+
+    private void updateHistoryButtons() {
+        if (backBtn != null) backBtn.setDisable(undoStack.isEmpty());
+        if (forwardBtn != null) forwardBtn.setDisable(redoStack.isEmpty());
+    }
+    
+    private void toggleChatMode() {
+        boolean enabled = chatModeCheck.isSelected();
+        chatBox.setVisible(enabled);
+        if (enabled) {
+            loadChatHistory();
+        } else {
+            saveChatHistory();
+        }
+    }
+    
+    private void handleChatCommand() {
+        String command = chatInput.getText().trim();
+        if (command.isEmpty()) return;
+        
+        // Add command to history
+        String entry = "> " + command + "\n";
+        chatHistory.appendText(entry);
+        chatLogs.add(entry);
+        
+        // Process command
+        processImageCommand(command);
+        
+        // Clear input
+        chatInput.clear();
+    }
+    
+    private void processImageCommand(String rawCommand) {
+        String command = rawCommand.toLowerCase().trim();
+
+        // Add response to chat
+        String response = "Processing: " + command + "\n";
+        chatHistory.appendText(response);
+        chatLogs.add(response);
+
+        try {
+            // 0) Help / hints (no image required)
+            if (containsAny(command, new String[]{"help","?","commands"})) {
+                addChatResponse(
+                    "Commands: open <file>, save <file>, remove background, detect shapes, seed <x> <y>, show mask, hide mask, set tolerance <n>, increase tolerance <n>, decrease tolerance <n>, enable drawing, disable drawing, reset preview"
+                );
+                return;
+            }
+
+            // 1) Open/Load image from path (quoted or unquoted)
+            if (startsWithAny(command, new String[]{"open ", "load ", "open", "load:\""})) {
+                String path = extractPathAfterKeyword(rawCommand, new String[]{"open", "load"});
+                if (path == null || path.isEmpty()) {
+                    addChatResponse("Please provide a file path, e.g., open C:/path/image.png");
+                    return;
+                }
+                File f = new File(path);
+                if (!f.exists()) {
+                    addChatResponse("File not found: " + f.getAbsolutePath());
+                    return;
+                }
+                openImageFile(f);
+                addChatResponse("Opened: " + f.getName());
+                return;
+            }
+
+            // 2) Save image (optional path)
+            if (startsWithAny(command, new String[]{"save ", "export ", "save", "export"}) || command.equals("save") || command.equals("export")) {
+                if (previewImage == null && originalImage == null) {
+                    addChatResponse("Nothing to save. Load or process an image first.");
+                    return;
+                }
+                String path = extractPathAfterKeyword(rawCommand, new String[]{"save", "export"});
+                if (path == null || path.isEmpty()) {
+                    addChatResponse("Please provide a .png path, e.g., save C:/path/out.png");
+                    return;
+                }
+                try {
+                    File out = new File(path);
+                    if (!out.getName().toLowerCase().endsWith(".png")) {
+                        File out2 = out;
+                        String strs = out2.getParentFile() == null ? "." : out2.getParentFile() + File.separator + out2.getName() + ".png";
+                        out = new File(strs);
+                    }
+                    BufferedImage toSave = (previewImage != null) ? previewImage : originalImage;
+                    ImageIO.write(toSave, "PNG", out);
+                    addChatResponse("Saved: " + out.getAbsolutePath());
+                } catch (IOException ioe) {
+                    addChatResponse("Save failed: " + ioe.getMessage());
+                }
+                return;
+            }
+
+            // For the remaining commands, ensure an image is loaded
+            if (originalImage == null) {
+                addChatResponse("Please load an image first (e.g., open <file>). ");
+                return;
+            }
+
+            // 3) Tolerance controls
+            if (containsAny(command, new String[]{"set tolerance", "tolerance"})) {
+                Integer n = extractFirstInteger(command);
+                if (n != null) {
+                    int clamped = Math.max(0, Math.min(200, n));
+                    toleranceSlider.setValue(clamped);
+                    addChatResponse("Tolerance set to " + clamped);
+                } else {
+                    addChatResponse("Specify a number, e.g., set tolerance 80");
+                }
+                return;
+            }
+            if (containsAny(command, new String[]{"increase tolerance", "raise tolerance", "more tolerance"})) {
+                Integer by = extractFirstInteger(command);
+                if (by == null) by = 10;
+                int clamped = (int)Math.max(0, Math.min(200, toleranceSlider.getValue() + by));
+                toleranceSlider.setValue(clamped);
+                addChatResponse("Tolerance increased to " + clamped);
+                return;
+            }
+            if (containsAny(command, new String[]{"decrease tolerance", "lower tolerance", "less tolerance"})) {
+                Integer by = extractFirstInteger(command);
+                if (by == null) by = 10;
+                int clamped = (int)Math.max(0, Math.min(200, toleranceSlider.getValue() - by));
+                toleranceSlider.setValue(clamped);
+                addChatResponse("Tolerance decreased to " + clamped);
+                return;
+            }
+
+            // 4) Mask visibility
+            if (containsAny(command, new String[]{"show mask", "enable mask", "mask on"})) {
+                if (lastMask == null) {
+                    addChatResponse("No mask available yet. Try remove background or seed crop.");
+                } else {
+                    showMaskCheck.setSelected(true);
+                    updateImageView(maskToDebugImage(lastMask));
+                    addChatResponse("Mask shown.");
+                }
+                return;
+            }
+            if (containsAny(command, new String[]{"hide mask", "disable mask", "mask off"})) {
+                showMaskCheck.setSelected(false);
+                updateImageView(previewImage != null ? previewImage : originalImage);
+                addChatResponse("Mask hidden.");
+                return;
+            }
+
+            // 5) Drawing mode
+            if (containsAny(command, new String[]{"enable drawing", "drawing on", "start drawing"})) {
+                drawingModeCheck.setSelected(true);
+                toggleDrawingMode();
+                addChatResponse("Drawing mode enabled.");
+                return;
+            }
+            if (containsAny(command, new String[]{"disable drawing", "drawing off", "stop drawing"})) {
+                drawingModeCheck.setSelected(false);
+                toggleDrawingMode();
+                addChatResponse("Drawing mode disabled.");
+                return;
+            }
+
+            // 6) Background removal (simple corners)
+            if (containsAny(command, new String[]{"remove background", "erase background", "make background transparent", "background remove", "crop background"})) {
+                int tol = (int) toleranceSlider.getValue();
+                BufferedImage newImg = simpleBackgroundRemoval(originalImage, tol);
+                applyNewImage(newImg);
+                addChatResponse("Background removed using tolerance " + tol + ".");
+                return;
+            }
+
+            // 7) Seed crop with coordinates: "seed 120 200" or "crop at 120,200"
+            Matcher mSeed = Pattern.compile("(seed|click|crop at)\\s*(?:x)?\\s*(\\d+)\\s*(?:,|\\s)+(?:y)?\\s*(\\d+)").matcher(command);
+            if (mSeed.find()) {
+                int px = Integer.parseInt(mSeed.group(2));
+                int py = Integer.parseInt(mSeed.group(3));
+                int tol = (int) toleranceSlider.getValue();
+                px = Math.max(0, Math.min(originalImage.getWidth()-1, px));
+                py = Math.max(0, Math.min(originalImage.getHeight()-1, py));
+                BufferedImage newImg = seedBasedCrop(originalImage, px, py, tol);
+                applyNewImage(newImg);
+                addChatResponse("Seed crop at (" + px + ", " + py + ") with tolerance " + tol + ".");
+                return;
+            }
+
+            // 8) Detect shapes
+            if (containsAny(command, new String[]{"detect", "find", "detect shapes", "find shapes"})) {
+                detectAndHighlightShapes();
+                return;
+            }
+
+            // 9) Reset preview
+            if (containsAny(command, new String[]{"reset", "revert", "original", "clear preview"})) {
+                // push current to undo and show original
+                BufferedImage current = getCurrentImage();
+                if (current != null) {
+                    if (undoStack.size() >= MAX_HISTORY) undoStack.removeFirst();
+                    undoStack.addLast(current);
+                }
+                redoStack.clear();
+                previewImage = null; // show original
+                showMaskCheck.setSelected(false);
+                lastMask = null;
+                updateImageView(originalImage);
+                updateHistoryButtons();
+                addChatResponse("Preview reset to original image.");
+                return;
+            }
+
+            // 10) Placeholders for future features
+            if (containsAny(command, new String[]{"combine", "merge"})) {
+                addChatResponse("Shape combining not implemented yet.");
+                return;
+            }
+            if (containsAny(command, new String[]{"split", "separate"})) {
+                addChatResponse("Shape splitting not implemented yet.");
+                return;
+            }
+
+            addChatResponse("Unknown command. Type 'help' for options.");
+        } catch (Exception e) {
+            addChatResponse("Error: " + e.getMessage());
+        }
+    }
+
+    private boolean containsAny(String text, String[] needles) {
+        for (String n : needles) {
+            if (text.contains(n)) return true;
+        }
+        return false;
+    }
+
+    private boolean startsWithAny(String text, String[] needles) {
+        for (String n : needles) {
+            if (text.startsWith(n)) return true;
+        }
+        return false;
+    }
+
+    private Integer extractFirstInteger(String text) {
+        Matcher m = Pattern.compile("(-?\\d+)").matcher(text);
+        if (m.find()) {
+            try { return Integer.parseInt(m.group(1)); } catch (NumberFormatException ignored) {}
+        }
+        return null;
+    }
+
+    private String extractPathAfterKeyword(String raw, String[] keys) {
+        // Preserve original casing and quotes; search case-insensitively for keyword then take rest
+        String r = raw.trim();
+        int idx = -1; String keyFound = null;
+        for (String k : keys) {
+            int i = r.toLowerCase().indexOf(k.toLowerCase());
+            if (i == 0) { idx = k.length(); keyFound = k; break; }
+        }
+        if (idx < 0) return null;
+        String tail = r.substring(idx).trim();
+        if (tail.startsWith(":")) tail = tail.substring(1).trim();
+        if (tail.startsWith("\"") && tail.endsWith("\"")) {
+            return tail.substring(1, tail.length()-1);
+        }
+        if (tail.startsWith("'") && tail.endsWith("'")) {
+            return tail.substring(1, tail.length()-1);
+        }
+        return tail;
+    }
+    
+    private void addChatResponse(String message) {
+        String response = "System: " + message + "\n";
+        chatHistory.appendText(response);
+        chatLogs.add(response);
+    }
+    
+    private void detectAndHighlightShapes() {
+        // Use the existing flood fill algorithm with multiple seed points
+        if (originalImage == null) return;
+        
+        int w = originalImage.getWidth();
+        int h = originalImage.getHeight();
+        boolean[][] visited = new boolean[w][h];
+        List<Point> seeds = findPotentialShapeSeeds(originalImage);
+        
+        if (seeds.isEmpty()) {
+            addChatResponse("No distinct shapes detected.");
+            return;
+        }
+        
+        // Use existing seed-based crop for each detected seed point
+        int tol = (int) toleranceSlider.getValue();
+        BufferedImage result = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = result.createGraphics();
+        g.drawImage(originalImage, 0, 0, null);
+        
+        for (Point seed : seeds) {
+            if (!visited[seed.x][seed.y]) {
+                BufferedImage shape = seedBasedCrop(originalImage, seed.x, seed.y, tol);
+                g.drawImage(shape, 0, 0, null);
+            }
+        }
+        g.dispose();
+        
+        applyNewImage(result);
+        addChatResponse("Detected " + seeds.size() + " potential shapes.");
+    }
+    
+    private List<Point> findPotentialShapeSeeds(BufferedImage img) {
+        List<Point> seeds = new ArrayList<>();
+        int w = img.getWidth();
+        int h = img.getHeight();
+        int step = Math.max(w, h) / 20; // Sample every 5% of the image
+        
+        for (int y = step; y < h - step; y += step) {
+            for (int x = step; x < w - step; x += step) {
+                if (isLocalColorDifference(img, x, y, step)) {
+                    seeds.add(new Point(x, y));
+                }
+            }
+        }
+        return seeds;
+    }
+    
+    private boolean isLocalColorDifference(BufferedImage img, int x, int y, int step) {
+        int center = img.getRGB(x, y);
+        int top = img.getRGB(x, Math.max(0, y - step));
+        int bottom = img.getRGB(x, Math.min(img.getHeight() - 1, y + step));
+        int left = img.getRGB(Math.max(0, x - step), y);
+        int right = img.getRGB(Math.min(img.getWidth() - 1, x + step), y);
+        
+        return colorDifference(center, top) > 30 ||
+               colorDifference(center, bottom) > 30 ||
+               colorDifference(center, left) > 30 ||
+               colorDifference(center, right) > 30;
+    }
+    
+    private int colorDifference(int rgb1, int rgb2) {
+        int r1 = (rgb1 >> 16) & 0xFF;
+        int g1 = (rgb1 >> 8) & 0xFF;
+        int b1 = rgb1 & 0xFF;
+        int r2 = (rgb2 >> 16) & 0xFF;
+        int g2 = (rgb2 >> 8) & 0xFF;
+        int b2 = rgb2 & 0xFF;
+        
+        return Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+    }
+    
+    private void loadChatHistory() {
+        try {
+            File file = new File(CHAT_LOG_FILE);
+            if (file.exists()) {
+                chatLogs = Files.readAllLines(file.toPath());
+                chatHistory.clear();
+                for (String log : chatLogs) {
+                    chatHistory.appendText(log + "\n");
+                }
+            }
+        } catch (IOException e) {
+            showError("Could not load chat history: " + e.getMessage());
+        }
+    }
+    
+    private void saveChatHistory() {
+        try {
+            Files.write(new File(CHAT_LOG_FILE).toPath(), chatLogs);
+        } catch (IOException e) {
+            showError("Could not save chat history: " + e.getMessage());
+        }
+    }
+    
+    private void toggleDrawingMode() {
+        boolean enabled = drawingModeCheck.isSelected();
+        drawCanvas.setMouseTransparent(!enabled);
+        if (enabled) {
+            setupDrawingHandlers();
+            drawGC.setStroke(javafx.scene.paint.Color.RED);
+            drawGC.setLineWidth(2);
+            drawGC.clearRect(0, 0, drawCanvas.getWidth(), drawCanvas.getHeight());
+        } else {
+            clearDrawing();
+        }
+    }
+    
+    private void setupDrawingHandlers() {
+        drawCanvas.setOnMousePressed(e -> {
+            if (originalImage == null) return;
+            isDrawing = true;
+            currentPath.clear();
+            Point2D imgPoint = convertToImageCoordinates(e.getX(), e.getY());
+            currentPath.add(imgPoint);
+            drawGC.beginPath();
+            drawGC.moveTo(e.getX(), e.getY());
+        });
+        
+        drawCanvas.setOnMouseDragged(e -> {
+            if (!isDrawing) return;
+            Point2D imgPoint = convertToImageCoordinates(e.getX(), e.getY());
+            currentPath.add(imgPoint);
+            drawGC.lineTo(e.getX(), e.getY());
+            drawGC.stroke();
+        });
+        
+        drawCanvas.setOnMouseReleased(e -> {
+            if (!isDrawing) return;
+            isDrawing = false;
+            Point2D imgPoint = convertToImageCoordinates(e.getX(), e.getY());
+            currentPath.add(imgPoint);
+            drawGC.lineTo(e.getX(), e.getY());
+            drawGC.stroke();
+            processDrawnShape();
+        });
+    }
+    
+    private Point2D convertToImageCoordinates(double x, double y) {
+        var fxImg = imageView.getImage();
+        if (fxImg == null) return new Point2D(x, y);
+        
+        Point2D local = imageView.sceneToLocal(x, y);
+        Bounds b = imageView.getBoundsInLocal();
+        
+        double scaleX = fxImg.getWidth() / b.getWidth();
+        double scaleY = fxImg.getHeight() / b.getHeight();
+        
+        return new Point2D(
+            Math.max(0, Math.min(fxImg.getWidth() - 1, local.getX() * scaleX)),
+            Math.max(0, Math.min(fxImg.getHeight() - 1, local.getY() * scaleY))
+        );
+    }
+    
+    private void clearDrawing() {
+        if (drawGC != null) {
+            drawGC.clearRect(0, 0, drawCanvas.getWidth(), drawCanvas.getHeight());
+        }
+        currentPath.clear();
+        isDrawing = false;
+    }
+    
+    private void processDrawnShape() {
+        if (currentPath.size() < 3 || originalImage == null) return;
+        
+        // Create a mask from the drawn path
+        int w = originalImage.getWidth();
+        int h = originalImage.getHeight();
+        boolean[][] shapeMask = new boolean[w][h];
+        
+        // Convert path to polygon
+        int[] xPoints = new int[currentPath.size()];
+        int[] yPoints = new int[currentPath.size()];
+        for (int i = 0; i < currentPath.size(); i++) {
+            Point2D p = currentPath.get(i);
+            xPoints[i] = (int) p.getX();
+            yPoints[i] = (int) p.getY();
+        }
+        
+        // Create polygon for shape detection
+        java.awt.Polygon poly = new java.awt.Polygon(xPoints, yPoints, currentPath.size());
+        
+        // Fill the mask based on the polygon
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                if (poly.contains(x, y)) {
+                    shapeMask[x][y] = true;
+                }
+            }
+        }
+        
+        // Use the mask to crop the image
+        BufferedImage newImg = applyShapeMask(originalImage, shapeMask);
+        applyNewImage(newImg);
+        
+        // Clear the drawing for the next shape
+        clearDrawing();
+    }
+    
+    private BufferedImage applyShapeMask(BufferedImage src, boolean[][] shapeMask) {
+        int w = src.getWidth(), h = src.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        int tol = (int) toleranceSlider.getValue();
+        
+        // Find seed points inside the shape
+        List<Point> seeds = new ArrayList<>();
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                if (shapeMask[x][y] && isLocalColorDifference(src, x, y, 5)) {
+                    seeds.add(new Point(x, y));
+                }
+            }
+        }
+        
+        // Apply flood fill from each seed point
+        Graphics2D g = out.createGraphics();
+        g.drawImage(src, 0, 0, null);
+        
+        for (Point seed : seeds) {
+            BufferedImage shape = seedBasedCrop(src, seed.x, seed.y, tol);
+            g.drawImage(shape, 0, 0, null);
+        }
+        g.dispose();
+        
         return out;
     }
 }
