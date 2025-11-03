@@ -55,7 +55,7 @@ public class ImageEditor extends Application {
     private Button loadBtn, saveBtn;
     private Button simpleCropBtn, seedCropBtn;
     private Button backBtn, forwardBtn;
-    private CheckBox showMaskCheck, chatModeCheck, drawingModeCheck;
+    private CheckBox showMaskCheck, chatModeCheck, drawingModeCheck, selectionModeCheck;
     private Slider toleranceSlider;
     
     // Drawing mode components
@@ -64,6 +64,12 @@ public class ImageEditor extends Application {
     private List<Point2D> currentPath;
     private boolean isDrawing = false;
     
+    // Selection mode components
+    private boolean isSelecting = false;
+    private double selStartCanvasX, selStartCanvasY, selEndCanvasX, selEndCanvasY;
+    private java.awt.Rectangle selectionRect; // in image pixel coordinates
+    private Button clearSelectionBtn;
+
     // Chat mode components
     private javafx.scene.control.TextArea chatInput;
     private javafx.scene.control.TextArea chatHistory;
@@ -124,6 +130,9 @@ public class ImageEditor extends Application {
                 if (px >= 0 && py >= 0 && px < originalImage.getWidth() && py < originalImage.getHeight()) {
                     int tol = (int) toleranceSlider.getValue();
                     BufferedImage newImg = seedBasedCrop(originalImage, px, py, tol);
+                    if (selectionRect != null) {
+                        newImg = combineWithSelection(originalImage, newImg, selectionRect);
+                    }
                     applyNewImage(newImg);
                 }
             }
@@ -147,6 +156,9 @@ public class ImageEditor extends Application {
                 return;
             int tol = (int) toleranceSlider.getValue();
             BufferedImage newImg = simpleBackgroundRemoval(originalImage, tol);
+            if (selectionRect != null) {
+                newImg = combineWithSelection(originalImage, newImg, selectionRect);
+            }
             applyNewImage(newImg);
         });
 
@@ -173,6 +185,11 @@ public class ImageEditor extends Application {
         
         drawingModeCheck = new CheckBox("Drawing Mode");
         drawingModeCheck.setOnAction(e -> toggleDrawingMode());
+
+        selectionModeCheck = new CheckBox("Selection Mode");
+        selectionModeCheck.setOnAction(e -> toggleSelectionMode());
+        clearSelectionBtn = new Button("Clear Selection");
+        clearSelectionBtn.setOnAction(e -> clearSelection());
         
         // History buttons
         backBtn = new Button("Back");
@@ -185,7 +202,7 @@ public class ImageEditor extends Application {
                 new Separator(), simpleCropBtn, seedCropBtn,
                 new Separator(), backBtn, forwardBtn,
                 new Separator(), tolLabel, toleranceSlider, showMaskCheck,
-                new Separator(), drawingModeCheck, chatModeCheck);
+                new Separator(), drawingModeCheck, selectionModeCheck, clearSelectionBtn, chatModeCheck);
         bar.setPadding(new Insets(8));
         
         // Initialize chat components
@@ -685,6 +702,9 @@ public class ImageEditor extends Application {
             if (containsAny(command, new String[]{"remove background", "erase background", "make background transparent", "background remove", "crop background"})) {
                 int tol = (int) toleranceSlider.getValue();
                 BufferedImage newImg = simpleBackgroundRemoval(originalImage, tol);
+                if (selectionRect != null) {
+                    newImg = combineWithSelection(originalImage, newImg, selectionRect);
+                }
                 applyNewImage(newImg);
                 addChatResponse("Background removed using tolerance " + tol + ".");
                 return;
@@ -699,6 +719,9 @@ public class ImageEditor extends Application {
                 px = Math.max(0, Math.min(originalImage.getWidth()-1, px));
                 py = Math.max(0, Math.min(originalImage.getHeight()-1, py));
                 BufferedImage newImg = seedBasedCrop(originalImage, px, py, tol);
+                if (selectionRect != null) {
+                    newImg = combineWithSelection(originalImage, newImg, selectionRect);
+                }
                 applyNewImage(newImg);
                 addChatResponse("Seed crop at (" + px + ", " + py + ") with tolerance " + tol + ".");
                 return;
@@ -887,6 +910,128 @@ public class ImageEditor extends Application {
         }
     }
     
+    private void toggleSelectionMode() {
+        boolean enabled = selectionModeCheck.isSelected();
+        // Disable drawing when selection is enabled to avoid conflicts
+        if (enabled && drawingModeCheck.isSelected()) {
+            drawingModeCheck.setSelected(false);
+            toggleDrawingMode();
+        }
+        drawCanvas.setMouseTransparent(!enabled);
+        if (enabled) {
+            setupSelectionHandlers();
+            // Visual style
+            drawGC.setStroke(javafx.scene.paint.Color.CORNFLOWERBLUE);
+            drawGC.setLineWidth(2);
+            // Redraw existing selection if any
+            drawGC.clearRect(0, 0, drawCanvas.getWidth(), drawCanvas.getHeight());
+            if (selectionRect != null) {
+                // approximate rectangle back to canvas by using stored last canvas coords if available
+                drawSelectionOverlay();
+            }
+        } else {
+            // Clear handlers and overlay
+            drawCanvas.setOnMousePressed(null);
+            drawCanvas.setOnMouseDragged(null);
+            drawCanvas.setOnMouseReleased(null);
+            drawGC.clearRect(0, 0, drawCanvas.getWidth(), drawCanvas.getHeight());
+        }
+    }
+
+    private void setupSelectionHandlers() {
+        drawCanvas.setOnMousePressed(e -> {
+            if (originalImage == null) return;
+            isSelecting = true;
+            selStartCanvasX = e.getX();
+            selStartCanvasY = e.getY();
+            selEndCanvasX = selStartCanvasX;
+            selEndCanvasY = selStartCanvasY;
+            // Initialize selectionRect in image coordinates
+            Point2D imgPoint = convertToImageCoordinates(e.getX(), e.getY());
+            int ix = (int) Math.round(imgPoint.getX());
+            int iy = (int) Math.round(imgPoint.getY());
+            selectionRect = new java.awt.Rectangle(ix, iy, 0, 0);
+            drawSelectionOverlay();
+        });
+
+        drawCanvas.setOnMouseDragged(e -> {
+            if (!isSelecting) return;
+            selEndCanvasX = e.getX();
+            selEndCanvasY = e.getY();
+            // Update rect in image coordinates
+            Point2D p1 = convertToImageCoordinates(selStartCanvasX, selStartCanvasY);
+            Point2D p2 = convertToImageCoordinates(selEndCanvasX, selEndCanvasY);
+            int x1 = (int) Math.floor(Math.min(p1.getX(), p2.getX()));
+            int y1 = (int) Math.floor(Math.min(p1.getY(), p2.getY()));
+            int x2 = (int) Math.ceil(Math.max(p1.getX(), p2.getX()));
+            int y2 = (int) Math.ceil(Math.max(p1.getY(), p2.getY()));
+            int w = Math.max(0, x2 - x1);
+            int h = Math.max(0, y2 - y1);
+            selectionRect = new java.awt.Rectangle(x1, y1, w, h);
+            drawSelectionOverlay();
+        });
+
+        drawCanvas.setOnMouseReleased(e -> {
+            if (!isSelecting) return;
+            isSelecting = false;
+            selEndCanvasX = e.getX();
+            selEndCanvasY = e.getY();
+            // Finalize image-space rectangle
+            Point2D p1 = convertToImageCoordinates(selStartCanvasX, selStartCanvasY);
+            Point2D p2 = convertToImageCoordinates(selEndCanvasX, selEndCanvasY);
+            int x1 = (int) Math.floor(Math.min(p1.getX(), p2.getX()));
+            int y1 = (int) Math.floor(Math.min(p1.getY(), p2.getY()));
+            int x2 = (int) Math.ceil(Math.max(p1.getX(), p2.getX()));
+            int y2 = (int) Math.ceil(Math.max(p1.getY(), p2.getY()));
+            int w = Math.max(0, x2 - x1);
+            int h = Math.max(0, y2 - y1);
+            selectionRect = new java.awt.Rectangle(x1, y1, w, h);
+            drawSelectionOverlay();
+        });
+    }
+
+    private void drawSelectionOverlay() {
+        drawGC.clearRect(0, 0, drawCanvas.getWidth(), drawCanvas.getHeight());
+        double x = Math.min(selStartCanvasX, selEndCanvasX);
+        double y = Math.min(selStartCanvasY, selEndCanvasY);
+        double w = Math.abs(selEndCanvasX - selStartCanvasX);
+        double h = Math.abs(selEndCanvasY - selStartCanvasY);
+        if (w <= 0 || h <= 0) return;
+        // Semi-transparent fill to visualize selection
+        drawGC.setGlobalAlpha(0.15);
+        drawGC.setFill(javafx.scene.paint.Color.CORNFLOWERBLUE);
+        drawGC.fillRect(x, y, w, h);
+        drawGC.setGlobalAlpha(1.0);
+        drawGC.setStroke(javafx.scene.paint.Color.CORNFLOWERBLUE);
+        drawGC.setLineDashes(8);
+        drawGC.strokeRect(x, y, w, h);
+        drawGC.setLineDashes(0);
+    }
+
+    private void clearSelection() {
+        selectionRect = null;
+        isSelecting = false;
+        selStartCanvasX = selStartCanvasY = selEndCanvasX = selEndCanvasY = 0;
+        drawGC.clearRect(0, 0, drawCanvas.getWidth(), drawCanvas.getHeight());
+    }
+
+    private BufferedImage combineWithSelection(BufferedImage original, BufferedImage processed, java.awt.Rectangle sel) {
+        if (original == null || processed == null || sel == null) return processed;
+        int w = original.getWidth();
+        int h = original.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                if (sel.contains(x, y)) {
+                    out.setRGB(x, y, processed.getRGB(x, y));
+                } else {
+                    out.setRGB(x, y, original.getRGB(x, y));
+                }
+            }
+        }
+        return out;
+    }
+
     private void toggleDrawingMode() {
         boolean enabled = drawingModeCheck.isSelected();
         drawCanvas.setMouseTransparent(!enabled);
